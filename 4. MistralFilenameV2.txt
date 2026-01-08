@@ -1,0 +1,95 @@
+public with sharing class MistralFilenameV2 {
+    // Constants at class level
+    private static final String API_KEY = 'YOUR-API-KEY';
+    private static final String MISTRAL_MODEL = 'mistralai/mistral-small-3.1-24b-instruct:free';
+    private static final Integer TIMEOUT_MS = 20000;
+    
+    @InvocableMethod(label='Mistral Filename')
+    public static void generateFilename() {
+        generateFilenameAsync();
+    }
+    
+    @future(callout=true)
+    public static void generateFilenameAsync() {
+        try {
+            // Get the most recent prompt
+            Mistral_Prompt__c lastPrompt = [SELECT Id, Mistral_Prompt_CSV__c 
+                                         FROM Mistral_Prompt__c 
+                                         ORDER BY CreatedDate DESC 
+                                         LIMIT 1];
+            
+            if(lastPrompt == null || String.isBlank(lastPrompt.Mistral_Prompt_CSV__c)) {
+                throw new CalloutException('No recent Mistral prompt found');
+            }
+            
+            // Get or initialize counter
+            Image_Generation_Settings__c settings = Image_Generation_Settings__c.getOrgDefaults();
+            if(settings == null || settings.Image_Counter__c == null) {
+                settings = new Image_Generation_Settings__c(SetupOwnerId = UserInfo.getOrganizationId());
+                settings.Image_Counter__c = 1;
+            } else {
+                settings.Image_Counter__c += 1;
+            }
+            
+            // Make API call
+            String generatedFilename = makeMistralAPICall(lastPrompt.Mistral_Prompt_CSV__c);
+            
+            if(String.isNotBlank(generatedFilename)) {
+                // Clean filename and format counter
+                generatedFilename = generatedFilename.trim().remove('"').remove('\'');
+                String counterStr = settings.Image_Counter__c < 10 ? '0' + settings.Image_Counter__c : String.valueOf(settings.Image_Counter__c);
+                
+                // UPDATE THE UPScaled_Image_Filename__c FIELD (THIS IS THE CRITICAL CHANGE)
+                lastPrompt.Upscaled_Image_Filename__c = counterStr + '_' + generatedFilename;
+                update lastPrompt;
+                
+                // Save counter
+                upsert settings;
+            }
+        } catch(Exception e) {
+            System.debug('Error in generateFilenameAsync: ' + e.getMessage() + '\n' + e.getStackTraceString());
+        }
+    }
+    
+    private static String makeMistralAPICall(String mistralCSVData) {
+        String csvPrompt = 'From the following text, identify the filename that ends with .jpeg and send it as a text response: {MistralCSVDescription}. Only return the filename. THERE MUST BE NO QUOTES. Example: revolution_silencieuse.jpeg'; 
+        
+        csvPrompt = csvPrompt.replace('{MistralCSVDescription}', mistralCSVData);
+        
+        HttpRequest req = new HttpRequest();
+        req.setEndpoint('callout:Mistral_NamedCred/api/v1/chat/completions');
+        req.setMethod('POST');
+        req.setBody(JSON.serialize(new Map<String, Object>{
+            'model' => MISTRAL_MODEL,
+            'messages' => new List<Map<String, String>>{
+                new Map<String, String>{
+                    'role' => 'user',
+                    'content' => csvPrompt
+                }
+            },
+            'temperature' => 0.7,
+            'max_tokens' => 500
+        }));
+        
+        req.setHeader('Content-Type', 'application/json');
+        req.setHeader('Authorization', 'Bearer ' + API_KEY);
+        req.setHeader('HTTP-Referer', 'https://orgfarm-c13c4c7918-dev-ed.develop.lightning.force.com/');
+        req.setHeader('X-Title', 'Gamma2 Project');
+        req.setTimeout(TIMEOUT_MS);
+        
+        HttpResponse res = new Http().send(req);
+        
+        if(res.getStatusCode() == 200) {
+            Map<String, Object> responseMap = (Map<String, Object>)JSON.deserializeUntyped(res.getBody());
+            if(responseMap.containsKey('choices')) {
+                List<Object> choices = (List<Object>)responseMap.get('choices');
+                if(!choices.isEmpty()) {
+                    Map<String, Object> firstChoice = (Map<String, Object>)choices[0];
+                    Map<String, Object> message = (Map<String, Object>)firstChoice.get('message');
+                    return (String)message.get('content');
+                }
+            }
+        }
+        throw new CalloutException('API Error ' + res.getStatusCode() + ': ' + res.getBody());
+    }
+}

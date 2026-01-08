@@ -1,0 +1,79 @@
+public with sharing class MistralCSV {
+    // Constants at class level
+    private static final String API_KEY = 'YOUR-API-KEY'; // Consider using Named Credentials instead
+    private static final String MISTRAL_MODEL = 'mistralai/mistral-small-3.1-24b-instruct:free';
+    private static final Integer TIMEOUT_MS = 20000;
+    
+    @InvocableMethod(label='Mistral CSV metadata')
+    public static void generateCSVMetadata() {
+        generateCSVMetadataAsync();
+    }
+    
+    @future(callout=true)
+    public static void generateCSVMetadataAsync() {
+        try {
+            Mistral_Prompt__c lastPrompt = [SELECT Id, Mistral_Prompt_Story__c 
+                                         FROM Mistral_Prompt__c 
+                                         ORDER BY CreatedDate DESC 
+                                         LIMIT 1];
+            
+            if(lastPrompt == null || String.isBlank(lastPrompt.Mistral_Prompt_Story__c)) {
+                throw new CalloutException('No recent Mistral prompt found');
+            }
+            
+            String generatedCSV = makeMistralAPICall(lastPrompt.Mistral_Prompt_Story__c);
+            
+            if(String.isNotBlank(generatedCSV)) {
+                lastPrompt.Mistral_Prompt_CSV__c = generatedCSV;
+                update lastPrompt;
+            }
+        } catch(Exception e) {
+            System.debug('Error in generateCSVMetadataAsync: ' + e.getMessage() + '\n' + e.getStackTraceString());
+        }
+    }
+    
+    private static String makeMistralAPICall(String mistralImagePrompt) {
+        String csvPrompt = 'Only write content to be copy-pasted in a .csv file. DO NOT add quotes at the beginning and end of your response. DO NOT add apostrophe in Description. The Description should NEVER have apostrophe. Generate a metadata description referencing the image generated from the following prompt: {MistralImagePrompt}. Generate a .CSV-formatted text for an image bank upload, based on the following requirements: 1. FILENAME: Invent a creative filename with .jpeg extension. The FILENAME SHOULD NOT CONTAIN: spaces, accents, special characters. FILENAME MAY CONTAIN underscores. 2. DESCRIPTION: Write a unique, detailed description in English. DESCRIPTION SHOULD NOT CONTAIN apostrophes DESCRIPTION MUST BE framed by "quotes". DESCRIPTION SHOULD BE less tha 200 characters. KEYWORDS:Between 7 and 50 keywords in English, chosen accordingly to the given prompt (e.g., "Nature,Digital,Animaux,Futuriste,City,Skyline,Coucher de Soleil,Paysage"). KEYWORDS ARE separated by commas. KEYWORDS ARE NOT separated by spaces. KEYWORDS ARE framed with "quotes" at the beginning and end of the list. CATEGORIES: 1–2 categories from the provided in the list. CATEGORIES ARE separated by commas. CATEGORIES ARE NOT separated by spaces. CATEGORIES ARE framed by "quotes" at the beginning and end of the list (e.g.:"Nature,Transports"). CONSTANT VALUES: Editorial=no, Mature content=no, Illustration=yes. FINAL FORMAT = 2 lines: 1 line for column titles, 1 line for content. IMPORTANT: GO TO THE NEXT LINE AFTER COLUMN TITLES. The line of COLUMN TITLES is IMMUTABLE and is:"Filename,Description,Keywords,Categories,Editorial,Mature content,Illustration" (WITHOUT "QUOTES"). The CONTENT line should contain:filename.jpeg(change it according to the prompt),[English description referencing the image],"keyword1,keyword2","category1,category2",no,yes,yes(end of line) // Categories list:Abstract,Animals/Wildlife,Arts,Backgrounds/Textures,Beauty/Fashion,Buildings/Landmarks,Business/Finance,Celebrities,Education,FoodandDrink,Healthcare/Medical,Holidays,Industrial,Interiors,Miscellaneous,Nature,Objects,Parks/Outdoor,People,Religion,Science,Signs/Symbols,Sports/Recreation,Technology,Transportation,Vintage(end of list)//IMPORTANT IMPORTANT: The CONTENT of KEYWORDS must ALWAYS be FRAMED BY "QUOTES"//IMPORTANT IMPORTANT: The CONTENT of CATEGORIES must ALWAYS be FRAMED BY "QUOTES"//IMPORTANT:NEVER NEVER WRITE OFFENSIVE CONTENT//IMPORTANT:COMMA SEPARATED WORDS SHOULD NEVER NEVER NEVER HAVE EXTRA SPACE AFTER THE COMMA//IMPORTANT:Descriptions and keywords MUST NOT CONTAIN trademarks such as brand names or product names//IMPORTANT:Limit KEYWORDS to what is EXPLICIT in the given prompt: DO NOT GUESS.'; 
+        
+        csvPrompt = csvPrompt.replace('{MistralImagePrompt}', mistralImagePrompt);
+        
+        HttpRequest req = new HttpRequest();
+        req.setEndpoint('callout:Mistral_NamedCred/api/v1/chat/completions');
+        req.setMethod('POST');
+        req.setBody(JSON.serialize(new Map<String, Object>{
+            'model' => MISTRAL_MODEL,
+            'messages' => new List<Map<String, String>>{
+                new Map<String, String>{
+                    'role' => 'user',
+                    'content' => csvPrompt
+                }
+            },
+            'temperature' => 0.7,
+            'max_tokens' => 500
+        }));
+        
+        req.setHeader('Content-Type', 'application/json');
+        req.setHeader('Authorization', 'Bearer ' + API_KEY);
+        req.setHeader('HTTP-Referer', 'https://orgfarm-c13c4c7918-dev-ed.develop.lightning.force.com/');
+        req.setHeader('X-Title', 'Gamma2 Project');
+        req.setTimeout(TIMEOUT_MS);
+        
+        HttpResponse res = new Http().send(req);
+        
+        if(res.getStatusCode() == 200) {
+            Map<String, Object> responseMap = (Map<String, Object>)JSON.deserializeUntyped(res.getBody());
+            
+            if(responseMap.containsKey('choices')) {
+                List<Object> choices = (List<Object>)responseMap.get('choices');
+                if(!choices.isEmpty()) {
+                    Map<String, Object> firstChoice = (Map<String, Object>)choices[0];
+                    Map<String, Object> message = (Map<String, Object>)firstChoice.get('message');
+                    return (String)message.get('content');
+                }
+            }
+        }
+        
+        Map<String, Object> errorResponse = (Map<String, Object>)JSON.deserializeUntyped(res.getBody());
+        throw new CalloutException('API Error ' + res.getStatusCode() + ': ' + JSON.serialize(errorResponse));
+    }
+}

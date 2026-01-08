@@ -1,0 +1,89 @@
+public class ApexToAWSLambdaV2 {
+    
+    @InvocableMethod(label='Generate CSV via Lambda' description='Calls AWS Lambda to generate a CSV file and stores the URL')
+    public static void generateCSV(List<ID> recordIds) {
+        if (recordIds == null || recordIds.isEmpty()) {
+            System.debug('No record IDs provided');
+            return;
+        }
+        
+        Id recordId = recordIds[0];
+        Mistral_Prompt__c prompt = [
+            SELECT Id, Mistral_Prompt_CSV__c, CSV_File_URL__c 
+            FROM Mistral_Prompt__c 
+            WHERE Id = :recordId
+            LIMIT 1
+        ];
+        
+        if (prompt == null) {
+            System.debug('No Mistral_Prompt__c record found with ID: ' + recordId);
+            return;
+        }
+        
+        if (String.isBlank(prompt.Mistral_Prompt_CSV__c)) {
+            System.debug('No CSV content found in Mistral_Prompt_CSV__c field');
+            return;
+        }
+        
+        // Get the custom setting for file naming
+        Image_Generation_Settings__c settings = Image_Generation_Settings__c.getOrgDefaults();
+        Integer counter = settings.Image_Counter__c != null ? Integer.valueOf(settings.Image_Counter__c) : 1;
+        String formattedCounter = String.valueOf(counter).leftPad(2, '0');
+        String filename = formattedCounter + '.CSV_Data.csv';
+        
+        // Call AWS Lambda
+        Http http = new Http();
+        HttpRequest request = new HttpRequest();
+        request.setEndpoint('YOUR-ENDPOINT');
+        request.setMethod('POST');
+        request.setHeader('Content-Type', 'application/json');
+        request.setTimeout(120000); // 2 minute timeout
+        
+        // Create JSON payload
+        Map<String, String> payload = new Map<String, String>{
+            'csv_content' => prompt.Mistral_Prompt_CSV__c,
+            'filename' => filename,
+            'salesforce_id' => prompt.Id
+        };
+        request.setBody(JSON.serialize(payload));
+        
+        try {
+            HttpResponse response = http.send(request);
+            Map<String, Object> responseBody = (Map<String, Object>)JSON.deserializeUntyped(
+                response.getBody()
+            );
+            
+            System.debug('Raw Lambda Response: ' + response.getBody());
+            
+            if (response.getStatusCode() == 200) {
+                String status = (String)responseBody.get('status');
+                
+                if (status == 'success') {
+                    System.debug('SUCCESS: ' + responseBody.get('message'));
+                    String fileUrl = (String)responseBody.get('file_url');
+                    
+                    // Update record with file URL
+                    prompt.CSV_File_URL__c = fileUrl;
+                    update prompt;
+                    
+                    // Increment the counter in custom settings
+                    settings.Image_Counter__c = counter + 1;
+                    update settings;
+                } else {
+                    System.debug('CSV GENERATION FAILED: ' + responseBody.get('message'));
+                    prompt.Error_Message__c = (String)responseBody.get('message');
+                    update prompt;
+                }
+            } else {
+                System.debug('LAMBDA ERROR: Status ' + response.getStatusCode());
+                prompt.Error_Message__c = 'HTTP ' + response.getStatusCode();
+                update prompt;
+            }
+            
+        } catch(Exception e) {
+            System.debug('CALLOUT EXCEPTION: ' + e.getMessage());
+            prompt.Error_Message__c = e.getMessage();
+            update prompt;
+        }
+    }
+}

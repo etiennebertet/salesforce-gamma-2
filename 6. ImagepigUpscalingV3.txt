@@ -1,0 +1,222 @@
+public class ImagepigUpscalingV3 {
+    
+    // Configuration constants
+    private static final String UPSCALE_API_URL = 'https://api.imagepig.com/upscale';
+    private static final String API_KEY = 'YOUR-API-KEY';
+    
+    @InvocableMethod(label='Upscale Image via Imagepig'
+                    description='Upscales an existing image attached to a record using Imagepig API')
+    public static void upscaleImage(List<Id> recordIds) {
+        if (recordIds == null || recordIds.isEmpty()) {
+            System.debug('ERROR: No record IDs provided');
+            return;
+        }
+
+        try {
+            System.debug('PROCESSING: Starting image upscale flow');
+            
+            // Get the record with Upscaled_Image__c and Upscaled_Image_Filename__c fields
+            Mistral_Prompt__c prompt = [SELECT Id, Upscaled_Image__c, Upscaled_Image_Filename__c 
+                                      FROM Mistral_Prompt__c
+                                      WHERE Id = :recordIds[0]
+                                      LIMIT 1];
+            
+            // Find the most recent image attached to this record
+            ContentDocumentLink[] links = [SELECT ContentDocumentId 
+                                         FROM ContentDocumentLink 
+                                         WHERE LinkedEntityId = :prompt.Id 
+                                         ORDER BY SystemModstamp DESC 
+                                         LIMIT 1];
+            
+            if (links.isEmpty()) {
+                System.debug('ERROR: No images found attached to record ' + prompt.Id);
+                return;
+            }
+            
+            ContentVersion[] versions = [SELECT VersionData, Title 
+                                       FROM ContentVersion 
+                                       WHERE ContentDocumentId = :links[0].ContentDocumentId 
+                                       AND IsLatest = true 
+                                       LIMIT 1];
+            
+            if (versions.isEmpty()) {
+                System.debug('ERROR: No image content found to upscale');
+                return;
+            }
+            
+            System.debug('PROCESSING: Upscaling image "' + versions[0].Title + '"');
+            
+            Map<String, Object> result = callUpscaleAPI(versions[0].VersionData, prompt.Id, prompt.Upscaled_Image_Filename__c);
+            
+            if (result.get('success') == true) {
+                System.debug('SUCCESS: Upscaled image stored in Upscaled_Image__c for record ' + prompt.Id);
+            } else {
+                System.debug('FAILED: ' + result.get('error'));
+            }
+        } catch (Exception e) {
+            System.debug('FATAL ERROR: ' + e.getMessage() +
+                         '\nSTACK TRACE: ' + e.getStackTraceString());
+        }
+    }
+
+    private static Map<String, Object> callUpscaleAPI(Blob imageData, Id recordId, String customFilename) {
+        Map<String, Object> result = new Map<String, Object>{
+            'success' => false,
+            'error' => null
+        };
+
+        try {
+            HttpRequest req = new HttpRequest();
+            req.setEndpoint(UPSCALE_API_URL);
+            req.setMethod('POST');
+            req.setHeader('Content-Type', 'application/json');
+            req.setHeader('Api-Key', API_KEY);
+            req.setTimeout(60000);
+            
+            String base64Image = EncodingUtil.base64Encode(imageData);
+            
+            Map<String, Object> requestBody = new Map<String, Object>{
+                'image_data' => base64Image,
+                'upscaling_factor' => 4,
+                'format' => 'JPEG',
+                'seed' => Math.abs(Crypto.getRandomInteger()),
+                'storage_days' => 1
+            };
+            
+            req.setBody(JSON.serialize(requestBody));
+            
+            HttpResponse res = new Http().send(req);
+            
+            switch on res.getStatusCode() {
+                when 200 {
+                    Map<String, Object> response = (Map<String, Object>)JSON.deserializeUntyped(res.getBody());
+                    if (response.containsKey('image_url')) {
+                        result.put('success', storeUpscaledImageFromUrl((String)response.get('image_url'), recordId, customFilename));
+                    } else if (response.containsKey('image_data')) {
+                        result.put('success', storeUpscaledImageFromData((String)response.get('image_data'), recordId, customFilename));
+                    } else {
+                        result.put('error', 'Unexpected upscale response format');
+                    }
+                }
+                when 400, 401, 403, 422 {
+                    result.put('error', parseImagepigError(res.getBody()));
+                }
+                when else {
+                    result.put('error', 'Upscale API Error: HTTP ' + res.getStatusCode());
+                }
+            }
+        } catch (Exception e) {
+            result.put('error', 'Upscale Exception: ' + e.getMessage());
+        }
+        return result;
+    }
+
+    private static Boolean storeUpscaledImageFromData(String imageData, Id recordId, String customFilename) {
+        try {
+            String cleanImageData = imageData.contains('base64,') ? 
+                imageData.substringAfter('base64,') : 
+                imageData;
+            
+            String filename = String.isNotBlank(customFilename) ? customFilename : 'Upscale_' + System.now().format('yyyyMMddHHmmss');
+            
+            // Create temporary ContentVersion to get public URL
+            ContentVersion cv = new ContentVersion(
+                Title = filename,
+                PathOnClient = filename + '.jpg',
+                VersionData = EncodingUtil.base64Decode(cleanImageData),
+                FirstPublishLocationId = recordId
+            );
+            insert cv;
+            
+            // Get the public URL
+            cv = [SELECT ContentDocumentId FROM ContentVersion WHERE Id = :cv.Id];
+            ContentDistribution cd = new ContentDistribution(
+                Name = 'Upscaled Image',
+                ContentVersionId = cv.Id,
+                PreferencesAllowViewInBrowser = true,
+                PreferencesLinkLatestVersion = true,
+                PreferencesNotifyOnVisit = false,
+                PreferencesPasswordRequired = false,
+                PreferencesAllowOriginalDownload = true
+            );
+            insert cd;
+            
+            cd = [SELECT DistributionPublicUrl FROM ContentDistribution WHERE Id = :cd.Id];
+            
+            // Update the record field
+            update new Mistral_Prompt__c(
+                Id = recordId,
+                Upscaled_Image__c = cd.DistributionPublicUrl
+            );
+            
+            return true;
+        } catch (Exception e) {
+            System.debug('BASE64 HANDLING ERROR: ' + e.getMessage());
+            return false;
+        }
+    }
+
+    private static Boolean storeUpscaledImageFromUrl(String imageUrl, Id recordId, String customFilename) {
+        try {
+            HttpRequest req = new HttpRequest();
+            req.setEndpoint(imageUrl);
+            req.setMethod('GET');
+            req.setTimeout(30000);
+            
+            HttpResponse res = new Http().send(req);
+            
+            if (res.getStatusCode() == 200) {
+                String filename = String.isNotBlank(customFilename) ? customFilename : 'Upscale_' + System.now().format('yyyyMMddHHmmss');
+                
+                // Create temporary ContentVersion to get public URL
+                ContentVersion cv = new ContentVersion(
+                    Title = filename,
+                    PathOnClient = filename + '.jpg',
+                    VersionData = res.getBodyAsBlob(),
+                    FirstPublishLocationId = recordId
+                );
+                insert cv;
+                
+                // Get the public URL
+                cv = [SELECT ContentDocumentId FROM ContentVersion WHERE Id = :cv.Id];
+                ContentDistribution cd = new ContentDistribution(
+                    Name = 'Upscaled Image',
+                    ContentVersionId = cv.Id,
+                    PreferencesAllowViewInBrowser = true,
+                    PreferencesLinkLatestVersion = true,
+                    PreferencesNotifyOnVisit = false,
+                    PreferencesPasswordRequired = false,
+                    PreferencesAllowOriginalDownload = true
+                );
+                insert cd;
+                
+                cd = [SELECT DistributionPublicUrl FROM ContentDistribution WHERE Id = :cd.Id];
+                
+                // Update the record field
+                update new Mistral_Prompt__c(
+                    Id = recordId,
+                    Upscaled_Image__c = cd.DistributionPublicUrl
+                );
+                
+                return true;
+            } else {
+                System.debug('UPSCALED IMAGE DOWNLOAD FAILED: HTTP ' + res.getStatusCode());
+                return false;
+            }
+        } catch (Exception e) {
+            System.debug('UPSCALED IMAGE SAVE ERROR: ' + e.getMessage());
+            return false;
+        }
+    }
+
+    private static String parseImagepigError(String responseBody) {
+        try {
+            Map<String, Object> error = (Map<String, Object>)JSON.deserializeUntyped(responseBody);
+            return error.containsKey('error') ? 
+                (String)error.get('error') : 
+                'Unknown error: ' + responseBody.left(200);
+        } catch (Exception e) {
+            return 'Unable to parse error: ' + responseBody.left(200);
+        }
+    }
+}

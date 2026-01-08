@@ -1,0 +1,161 @@
+public class ImagepigImageGeneratorV2 {
+    
+    // Configuration constants
+    private static final String API_BASE_URL = 'https://api.imagepig.com/flux';
+    private static final String API_KEY = 'YOUR-API-KEY';
+    private static final Integer MAX_POLL_ATTEMPTS = 15;
+    private static final Integer POLL_DELAY_MS = 10000;
+    
+    @InvocableMethod(label='Generate Image via FLUX.1 [schnell]'
+                    description='Generates images using Imagepig FLUX model')
+    public static void generateImage(List<Id> recordIds) {
+        if (recordIds == null || recordIds.isEmpty()) {
+            System.debug('ERROR: No record IDs provided');
+            return;
+        }
+
+        try {
+            System.debug('PROCESSING: Starting image generation flow');
+            
+            Mistral_Prompt__c prompt = [SELECT Id, Mistral_Prompt_Story__c, Created_Image__c
+                                      FROM Mistral_Prompt__c
+                                      WHERE Id = :recordIds[0]
+                                      LIMIT 1];
+            
+            System.debug('PROCESSING: Generating image for: ' + prompt.Mistral_Prompt_Story__c.left(50) + '...');
+            
+            Map<String, Object> result = generateImageFromPrompt(prompt.Mistral_Prompt_Story__c, recordIds[0]);
+            
+            if (result.get('success') == true) {
+                if (result.get('imageUrl') != null) {
+                    updateImageField(prompt.Id, (String)result.get('imageUrl'));
+                }
+                System.debug('SUCCESS: Image URL stored in Created_Image__c field for record ' + prompt.Id);
+            } else {
+                System.debug('FAILED: ' + result.get('error'));
+            }
+        } catch (Exception e) {
+            System.debug('FATAL ERROR: ' + e.getMessage() +
+                         '\nSTACK TRACE: ' + e.getStackTraceString());
+        }
+    }
+
+    private static Map<String, Object> generateImageFromPrompt(String prompt, Id recordId) {
+        Map<String, Object> result = new Map<String, Object>{
+            'success' => false,
+            'imageUrl' => null,
+            'error' => null
+        };
+
+        try {
+            HttpRequest req = new HttpRequest();
+            req.setEndpoint(API_BASE_URL);
+            req.setMethod('POST');
+            req.setHeader('Content-Type', 'application/json');
+            req.setHeader('Api-Key', '7b88d37b-8e20-4fc3-8723-3507e8d1dc44');
+            req.setTimeout(60000);
+            
+            Map<String, Object> requestBody = new Map<String, Object>{
+                'prompt' => prompt,
+                'proportion' => 'square',
+                'format' => 'JPEG',
+                'seed' => Math.abs(Crypto.getRandomInteger()),
+                'storage_days' => 1 // Using URL storage to avoid complex base64 handling
+            };
+            
+            req.setBody(JSON.serialize(requestBody));
+            
+            HttpResponse res = new Http().send(req);
+            
+            switch on res.getStatusCode() {
+                when 200 {
+                    Map<String, Object> response = (Map<String, Object>)JSON.deserializeUntyped(res.getBody());
+                    if (response.containsKey('image_url')) {
+                        result.put('imageUrl', (String)response.get('image_url'));
+                        result.put('success', true);
+                    } else if (response.containsKey('image_data')) {
+                        // Simplified base64 handling without complex regex
+                        result.put('success', handleSimpleBase64Image(
+                            (String)response.get('image_data'),
+                            recordId
+                        ));
+                    } else {
+                        result.put('error', 'Unexpected response format');
+                    }
+                }
+                when 400, 401, 403, 422 {
+                    result.put('error', parseImagepigError(res.getBody()));
+                }
+                when else {
+                    result.put('error', 'API Error: HTTP ' + res.getStatusCode());
+                }
+            }
+        } catch (Exception e) {
+            result.put('error', 'Exception: ' + e.getMessage());
+        }
+        return result;
+    }
+
+    private static Boolean handleSimpleBase64Image(String imageData, Id recordId) {
+        try {
+            // Simple base64 handling without complex regex
+            String cleanImageData = imageData.contains('base64,') ? 
+                imageData.substringAfter('base64,') : 
+                imageData;
+            
+            // Create ContentVersion to generate URL
+            ContentVersion cv = new ContentVersion(
+                Title = 'FLUX Generated Image - ' + DateTime.now().format('yyyy-MM-dd HH:mm:ss'),
+                PathOnClient = 'generated_image.png',
+                VersionData = EncodingUtil.base64Decode(cleanImageData),
+                FirstPublishLocationId = recordId
+            );
+            insert cv;
+            
+            // Get the public URL
+            cv = [SELECT ContentDocumentId FROM ContentVersion WHERE Id = :cv.Id];
+            ContentDistribution cd = new ContentDistribution(
+                Name = 'FLUX Generated Image',
+                ContentVersionId = cv.Id,
+                PreferencesAllowViewInBrowser = true,
+                PreferencesLinkLatestVersion = true,
+                PreferencesNotifyOnVisit = false,
+                PreferencesPasswordRequired = false,
+                PreferencesAllowOriginalDownload = true
+            );
+            insert cd;
+            
+            cd = [SELECT DistributionPublicUrl FROM ContentDistribution WHERE Id = :cd.Id];
+            
+            // Update the record field
+            updateImageField(recordId, cd.DistributionPublicUrl);
+            return true;
+        } catch (Exception e) {
+            System.debug('BASE64 HANDLING ERROR: ' + e.getMessage());
+            return false;
+        }
+    }
+
+    private static String parseImagepigError(String responseBody) {
+        try {
+            Map<String, Object> error = (Map<String, Object>)JSON.deserializeUntyped(responseBody);
+            return error.containsKey('error') ? 
+                (String)error.get('error') : 
+                'Unknown error: ' + responseBody.left(200);
+        } catch (Exception e) {
+            return 'Unable to parse error: ' + responseBody.left(200);
+        }
+    }
+
+    private static void updateImageField(Id recordId, String imageUrl) {
+        try {
+            Mistral_Prompt__c prompt = new Mistral_Prompt__c(
+                Id = recordId,
+                Created_Image__c = imageUrl
+            );
+            update prompt;
+        } catch (Exception e) {
+            System.debug('IMAGE FIELD UPDATE ERROR: ' + e.getMessage());
+        }
+    }
+}

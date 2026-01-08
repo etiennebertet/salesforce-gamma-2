@@ -1,0 +1,79 @@
+public with sharing class MistralCSV2 {
+    // Constants at class level
+    private static final String API_KEY = 'YOUR-API-KEY';
+    private static final String MISTRAL_MODEL = 'mistralai/mistral-small-3.1-24b-instruct:free';
+    private static final Integer TIMEOUT_MS = 20000;
+    
+    @InvocableMethod(label='Mistral CSV metadata')
+    public static void generateCSVMetadata() {
+        generateCSVMetadataAsync();
+    }
+    
+    @future(callout=true)
+    public static void generateCSVMetadataAsync() {
+        try {
+            Mistral_Prompt__c lastPrompt = [SELECT Id, Mistral_Prompt_CSV__c, Upscaled_Image_Filename__c 
+                                         FROM Mistral_Prompt__c 
+                                         ORDER BY CreatedDate DESC 
+                                         LIMIT 1];
+            
+            if(lastPrompt == null || String.isBlank(lastPrompt.Mistral_Prompt_CSV__c)) {
+                throw new CalloutException('No recent Mistral prompt found');
+            }
+            
+            String generatedCSV = makeMistralAPICall(lastPrompt.Mistral_Prompt_CSV__c, lastPrompt.Upscaled_Image_Filename__c);
+            
+            if(String.isNotBlank(generatedCSV)) {
+                lastPrompt.Mistral_Prompt_CSV__c = generatedCSV;
+                update lastPrompt;
+            }
+        } catch(Exception e) {
+            System.debug('Error in generateCSVMetadataAsync: ' + e.getMessage() + '\n' + e.getStackTraceString());
+        }
+    }
+    
+    private static String makeMistralAPICall(String mistralCSVPrompt, String imageFilename) {
+        String csvPrompt = 'Update this CSV metadata using the filename "' + imageFilename + '". Keep all formatting exactly the same, including the quotes around Description, Keywords and Categories. DO NOT add quotes at the beginning and end of your response. Here is the original CSV to update: {MistralCSVPrompt}. IMPORTANT: Preserve the exact format with 2 lines (column titles + content). GO TO THE NEXT LINE AFTER COLUMN TITLES. Only change the filename portion, keep all other metadata intact. The response must begin with "Filename,Description,Keywords,Categories,Editorial,Mature content,Illustration" followed by a newline, then the updated content line.'; 
+        
+        csvPrompt = csvPrompt.replace('{MistralCSVPrompt}', mistralCSVPrompt);
+        
+        HttpRequest req = new HttpRequest();
+        req.setEndpoint('callout:Mistral_NamedCred/api/v1/chat/completions');
+        req.setMethod('POST');
+        req.setBody(JSON.serialize(new Map<String, Object>{
+            'model' => MISTRAL_MODEL,
+            'messages' => new List<Map<String, String>>{
+                new Map<String, String>{
+                    'role' => 'user',
+                    'content' => csvPrompt
+                }
+            },
+            'temperature' => 0.7,
+            'max_tokens' => 500
+        }));
+        
+        req.setHeader('Content-Type', 'application/json');
+        req.setHeader('Authorization', 'Bearer ' + API_KEY);
+        req.setHeader('HTTP-Referer', 'https://orgfarm-c13c4c7918-dev-ed.develop.lightning.force.com/');
+        req.setHeader('X-Title', 'Gamma2 Project');
+        req.setTimeout(TIMEOUT_MS);
+        
+        HttpResponse res = new Http().send(req);
+        
+        if(res.getStatusCode() == 200) {
+            Map<String, Object> responseMap = (Map<String, Object>)JSON.deserializeUntyped(res.getBody());
+            
+            if(responseMap.containsKey('choices')) {
+                List<Object> choices = (List<Object>)responseMap.get('choices');
+                if(!choices.isEmpty()) {
+                    Map<String, Object> firstChoice = (Map<String, Object>)choices[0];
+                    Map<String, Object> message = (Map<String, Object>)firstChoice.get('message');
+                    return (String)message.get('content');
+                }
+            }
+        }
+        
+        Map<String, Object> errorResponse = (Map<String, Object>)JSON.deserializeUntyped(res.getBody());
+        throw new CalloutException('API Error ' + res.getStatusCode() + ': ' + JSON.serialize(errorResponse));
+    }
+}

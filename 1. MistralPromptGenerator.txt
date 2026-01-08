@@ -1,0 +1,81 @@
+public with sharing class MistralPromptGenerator {
+    
+    @InvocableMethod(label='Generate AI Prompt')
+    public static void generatePrompt() {
+        // Call the future method to handle the callout
+        generatePromptAsync();
+    }
+    
+    @future(callout=true)
+    public static void generatePromptAsync() {
+        try {
+            // 1. Make the API callout
+            String generatedText = makeMistralAPICall();
+            
+            // 2. Create record with the response
+            if(String.isNotBlank(generatedText)) {
+                Mistral_Prompt__c newPrompt = new Mistral_Prompt__c(
+                    Mistral_Prompt_Story__c = generatedText,
+                    Model_Used__c = 'mistral-7b-instruct'
+                );
+                insert newPrompt;
+            }
+        } catch(Exception e) {
+            System.debug('Error in generatePromptAsync: ' + e.getMessage() + '\n' + e.getStackTraceString());
+            // Consider adding error logging to a custom object here
+        }
+    }
+    
+    private static String makeMistralAPICall() {
+        // 1. Prepare request with corrected model ID
+        String endpoint = '/api/v1/chat/completions';
+        
+        Map<String, Object> requestBody = new Map<String, Object>{
+            'model' => 'mistralai/mistral-small-3.1-24b-instruct:free',
+            'messages' => new List<Map<String, String>>{
+                new Map<String, String>{
+                    'role' => 'user',
+                    'content' => 'Generate a creative writing prompt about technology.'
+                }
+            },
+            'temperature' => 0.7,
+            'max_tokens' => 100
+        };
+
+        // 2. Make API call with all required headers
+        HttpRequest req = new HttpRequest();
+        req.setEndpoint('callout:Mistral_NamedCred' + endpoint);
+        req.setMethod('POST');
+        req.setBody(JSON.serialize(requestBody));
+        req.setHeader('Content-Type', 'application/json');
+        
+        // REQUIRED headers per documentation
+        req.setHeader('Authorization', 'Bearer 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');
+        req.setHeader('HTTP-Referer', 'https://orgfarm-c13c4c7918-dev-ed.develop.lightning.force.com/');
+        req.setHeader('X-Title', 'Gamma2 Project');
+        
+        req.setTimeout(20000);
+        
+        // 3. Execute and debug
+        HttpResponse res = new Http().send(req);
+        System.debug('Full Response: ' + res.getBody());
+        
+        // 4. Process response with proper field names
+        if(res.getStatusCode() == 200) {
+            Map<String, Object> responseMap = (Map<String, Object>)JSON.deserializeUntyped(res.getBody());
+            
+            if(responseMap.containsKey('choices')) {
+                List<Object> choices = (List<Object>)responseMap.get('choices');
+                if(!choices.isEmpty()) {
+                    Map<String, Object> firstChoice = (Map<String, Object>)choices[0];
+                    Map<String, Object> message = (Map<String, Object>)firstChoice.get('message');
+                    return (String)message.get('content');
+                }
+            }
+        }
+        
+        // Enhanced error handling
+        Map<String, Object> errorResponse = (Map<String, Object>)JSON.deserializeUntyped(res.getBody());
+        throw new CalloutException('API Error ' + res.getStatusCode() + ': ' + JSON.serialize(errorResponse));
+    }
+}

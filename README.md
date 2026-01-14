@@ -32,9 +32,9 @@ Step 8: The AWS Lambda file executes:
 ![Screenshot of the Salesforce Flow](images/screenshot-1.png)
 ![Screenshot of the Salesforce Flow](images/screenshot-2.png)
 
-<strong>The record created and the corresponding fields</strong>
+<strong>The record created and the corresponding fields:</strong>
 ![Screenshot of the Salesforce Record](images/screenshot-3.png)
 ![Screenshot of the Salesforce Record](images/screenshot-4.png)
 
-<strong>Example of an image automatically generated</strong>
+<strong>Example of an image automatically generated:</strong>
 ![Example of a picture generated](images/image-test-1.png)
